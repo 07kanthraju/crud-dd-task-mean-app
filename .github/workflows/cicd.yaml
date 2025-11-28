@@ -1,0 +1,111 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mean-frontend
+  BACKEND_IMAGE:  ${{ secrets.DOCKERHUB_USERNAME }}/mean-backend
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHA_TAG=sha-${GITHUB_SHA::7}
+          echo "sha_tag=$SHA_TAG" >> $GITHUB_OUTPUT
+          echo "latest_tag=latest" >> $GITHUB_OUTPUT
+
+      # ---------- FRONTEND ----------
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.tags.outputs.latest_tag }}
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.tags.outputs.sha_tag }}
+
+      # ---------- BACKEND ----------
+      - name: Build & push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:${{ steps.tags.outputs.latest_tag }}
+            ${{ env.BACKEND_IMAGE }}:${{ steps.tags.outputs.sha_tag }}
+
+      # ---------- Copy deploy files to VM ----------
+      - name: Copy docker-compose & nginx config to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: |
+            docker-compose.yml
+            reverse-proxy/*
+            .env
+          target: "~/mean-app"
+
+      # ---------- Deploy on remote VM ----------
+      - name: Pull latest images & restart containers
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd ~/mean-app
+
+            echo "--- Checking .env ---"
+            if [ ! -f .env ]; then
+              echo "Creating default .env file"
+              cat <<EOF > .env
+DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+IMAGE_TAG=latest
+MONGO_INITDB_DATABASE=dd_db
+EOF
+            else
+              if ! grep -q '^DOCKERHUB_USERNAME=' .env; then
+                echo "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}" >> .env
+              fi
+            fi
+
+            export $(grep -v '^#' .env | xargs) || true
+            echo "--- Pulling latest images ---"
+            docker compose pull
+            echo "--- Restarting containers ---"
+            docker compose up -d --remove-orphans
+            echo "--- Cleaning old images ---"
+            docker image prune -f
+
+            echo "Deployment complete on $(hostname)"
